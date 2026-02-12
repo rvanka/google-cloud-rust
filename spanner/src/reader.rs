@@ -287,6 +287,7 @@ where
     resumable: bool,
     end_of_stream: bool,
     stream_retry: StreamingRetry,
+    pub(crate) precommit_token_handler: Option<Arc<dyn Fn(Option<google_cloud_googleapis::spanner::v1::MultiplexedSessionPrecommitToken>) + Send + Sync>>,
 }
 
 impl<'a, T> RowIterator<'a, T>
@@ -321,6 +322,7 @@ where
             resumable: true,
             end_of_stream: false,
             stream_retry: StreamingRetry::new(),
+            precommit_token_handler: None,
         })
     }
 
@@ -379,6 +381,9 @@ where
                 Some(result_set) => {
                     if result_set.last {
                         self.end_of_stream = true;
+                    }
+                    if let Some(ref handler) = self.precommit_token_handler {
+                        handler(result_set.precommit_token.clone());
                     }
                     self.prs_buffer.push(result_set);
                     if self.prs_buffer.unretryable {

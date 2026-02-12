@@ -1,8 +1,10 @@
 use std::ops::Deref;
 use std::ops::DerefMut;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use prost_types::Struct;
 
 use crate::session::ManagedSession;
@@ -97,7 +99,7 @@ impl From<CommitResponse> for CommitResult {
 /// amount of wall time spent retrying.
 pub struct ReadWriteTransaction {
     base_tx: Transaction,
-    tx_id: Vec<u8>,
+    pub(crate) tx_id: Vec<u8>,
     wb: Vec<Mutation>,
 }
 
@@ -126,13 +128,18 @@ impl ReadWriteTransaction {
         options: CallOptions,
         transaction_tag: Option<String>,
         disable_route_to_leader: bool,
+        previous_transaction_id: Option<Vec<u8>>,
     ) -> Result<ReadWriteTransaction, BeginError> {
         ReadWriteTransaction::begin_internal(
             session,
-            transaction_options::Mode::ReadWrite(transaction_options::ReadWrite::default()),
+            transaction_options::Mode::ReadWrite(transaction_options::ReadWrite {
+                multiplexed_session_previous_transaction_id: previous_transaction_id.clone().unwrap_or_default(),
+                ..Default::default()
+            }),
             options,
             transaction_tag,
             disable_route_to_leader,
+            previous_transaction_id,
         )
         .await
     }
@@ -149,6 +156,7 @@ impl ReadWriteTransaction {
             options,
             transaction_tag,
             disable_route_to_leader,
+            None,
         )
         .await
     }
@@ -159,6 +167,7 @@ impl ReadWriteTransaction {
         options: CallOptions,
         transaction_tag: Option<String>,
         disable_route_to_leader: bool,
+        previous_transaction_id: Option<Vec<u8>>,
     ) -> Result<ReadWriteTransaction, BeginError> {
         let request = BeginTransactionRequest {
             session: session.session.name.to_string(),
@@ -190,6 +199,8 @@ impl ReadWriteTransaction {
                 },
                 transaction_tag,
                 disable_route_to_leader,
+                latest_precommit_token: Arc::new(Mutex::new(None)),
+                _previous_transaction_id: previous_transaction_id,
             },
             tx_id: tx.id,
             wb: vec![],
@@ -230,8 +241,9 @@ impl ReadWriteTransaction {
             .spanner_client
             .execute_sql(request, disable_route_to_leader, options.call_options.retry)
             .await;
-        let response = session.invalidate_if_needed(result).await?;
-        Ok(extract_row_count(response.into_inner().stats))
+        let response = session.invalidate_if_needed(result).await?.into_inner();
+        self.update_precommit_token(response.precommit_token);
+        Ok(extract_row_count(response.stats))
     }
 
     pub async fn batch_update(&mut self, stmt: Vec<Statement>) -> Result<Vec<i64>, Status> {
@@ -268,9 +280,9 @@ impl ReadWriteTransaction {
             .spanner_client
             .execute_batch_dml(request, disable_route_to_leader, options.call_options.retry)
             .await;
-        let response = session.invalidate_if_needed(result).await?;
+        let response = session.invalidate_if_needed(result).await?.into_inner();
+        self.update_precommit_token(response.precommit_token);
         Ok(response
-            .into_inner()
             .result_sets
             .into_iter()
             .map(|x| extract_row_count(x.stats))
@@ -352,8 +364,17 @@ impl ReadWriteTransaction {
         let tx_id = self.tx_id.clone();
         let mutations = self.wb.to_vec();
         let disable_route_to_leader = self.disable_route_to_leader;
+        let precommit_token = self.latest_precommit_token.lock().clone();
         let session = self.as_mut_session();
-        commit(session, mutations, TransactionId(tx_id), options, disable_route_to_leader).await
+        commit(
+            session,
+            mutations,
+            TransactionId(tx_id),
+            options,
+            disable_route_to_leader,
+            precommit_token,
+        )
+        .await
     }
 
     pub(crate) async fn rollback(&mut self, retry: Option<RetrySetting>) -> Result<(), Status> {
@@ -378,28 +399,51 @@ pub(crate) async fn commit(
     tx: commit_request::Transaction,
     commit_options: CommitOptions,
     disable_route_to_leader: bool,
+    precommit_token: Option<google_cloud_googleapis::spanner::v1::MultiplexedSessionPrecommitToken>,
 ) -> Result<CommitResponse, Status> {
     let request = CommitRequest {
         session: session.session.name.to_string(),
-        mutations: ms,
-        transaction: Some(tx),
+        mutations: ms.clone(),
+        transaction: Some(tx.clone()),
         request_options: Transaction::create_request_options(
             commit_options.call_options.priority,
             commit_options.transaction_tag.clone(),
         ),
         return_commit_stats: commit_options.return_commit_stats,
         max_commit_delay: commit_options.max_commit_delay.map(|d| d.try_into().unwrap()),
-        precommit_token: None,
+        precommit_token,
     };
     let result = session
         .spanner_client
-        .commit(request, disable_route_to_leader, commit_options.call_options.retry)
+        .commit(request, disable_route_to_leader, commit_options.call_options.retry.clone())
         .await;
-    let response = session.invalidate_if_needed(result).await;
-    match response {
-        Ok(r) => Ok(r.into_inner()),
-        Err(s) => Err(s),
+    let response = session.invalidate_if_needed(result).await?;
+    let mut commit_response = response.into_inner();
+
+    if let Some(retry) = commit_response.multiplexed_session_retry.take() {
+        match retry {
+            google_cloud_googleapis::spanner::v1::commit_response::MultiplexedSessionRetry::PrecommitToken(token) => {
+                let retry_request = CommitRequest {
+                    session: session.session.name.to_string(),
+                    mutations: ms,
+                    transaction: Some(tx),
+                    request_options: Transaction::create_request_options(
+                        commit_options.call_options.priority,
+                        commit_options.transaction_tag.clone(),
+                    ),
+                    return_commit_stats: commit_options.return_commit_stats,
+                    max_commit_delay: commit_options.max_commit_delay.map(|d| d.try_into().unwrap()),
+                    precommit_token: Some(token),
+                };
+                let result = session
+                    .spanner_client
+                    .commit(retry_request, disable_route_to_leader, commit_options.call_options.retry)
+                    .await;
+                commit_response = session.invalidate_if_needed(result).await?.into_inner();
+            }
+        }
     }
+    Ok(commit_response)
 }
 
 fn extract_row_count(rs: Option<ResultSetStats>) -> i64 {

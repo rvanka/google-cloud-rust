@@ -16,7 +16,9 @@ use tokio_util::sync::CancellationToken;
 use google_cloud_gax::grpc::metadata::MetadataMap;
 use google_cloud_gax::grpc::{Code, Status};
 use google_cloud_gax::retry::TryAs;
-use google_cloud_googleapis::spanner::v1::{BatchCreateSessionsRequest, DeleteSessionRequest, Session};
+use google_cloud_googleapis::spanner::v1::{
+    BatchCreateSessionsRequest, CreateSessionRequest, DeleteSessionRequest, Session,
+};
 
 use crate::apiv1::conn_pool::ConnectionManager;
 use crate::apiv1::spanner_client::{ping_query_request, Client};
@@ -25,6 +27,7 @@ use crate::metrics::{MetricsRecorder, SessionPoolSnapshot, SessionPoolStatsFn};
 const MAX_IN_USE_WINDOW: Duration = Duration::from_secs(600);
 
 /// Session
+#[derive(Clone)]
 pub struct SessionHandle {
     pub session: Session,
     pub spanner_client: Client,
@@ -114,7 +117,7 @@ impl DerefMut for ManagedSession {
 
 /// Sessions have all sessions and waiters.
 /// This is for atomically locking the waiting list and free sessions.
-struct Sessions {
+pub(crate) struct Sessions {
     available_sessions: VecDeque<SessionHandle>,
 
     waiters: VecDeque<oneshot::Sender<()>>,
@@ -132,6 +135,9 @@ struct Sessions {
     max_inuse_window: usize,
     /// Start of the rolling window used for `max_inuse_window`.
     window_started_at: Instant,
+
+    /// Multiplexed session.
+    multiplexed_session: Option<SessionHandle>,
 }
 
 impl Sessions {
@@ -221,11 +227,11 @@ impl Sessions {
 }
 
 #[derive(Clone)]
-struct SessionPool {
-    inner: Arc<RwLock<Sessions>>,
-    session_creation_sender: UnboundedSender<usize>,
-    config: Arc<SessionConfig>,
-    metrics: Arc<MetricsRecorder>,
+pub(crate) struct SessionPool {
+    pub(crate) inner: Arc<RwLock<Sessions>>,
+    pub(crate) session_creation_sender: UnboundedSender<usize>,
+    pub(crate) config: Arc<SessionConfig>,
+    pub(crate) metrics: Arc<MetricsRecorder>,
 }
 
 impl SessionPool {
@@ -248,6 +254,7 @@ impl SessionPool {
                 num_creating: 0,
                 max_inuse_window: 0,
                 window_started_at: Instant::now(),
+                multiplexed_session: None,
             })),
             session_creation_sender,
             config,
@@ -371,6 +378,12 @@ impl SessionPool {
     ///    If the session is invalid
     ///  - Discard the session. If the number of sessions falls below the threshold as a result of discarding, the session replenishment process is called.
     fn recycle(&self, mut session: SessionHandle) {
+        if session.session.multiplexed {
+            if !session.valid {
+                self.inner.write().multiplexed_session = None;
+            }
+            return;
+        }
         self.metrics.record_session_released();
         if session.valid {
             let mut sessions = self.inner.write();
@@ -423,7 +436,7 @@ impl SessionPool {
                 idle_sessions: sessions.available_sessions.len(),
                 max_allowed_sessions: max_allowed,
                 max_in_use_last_window: sessions.max_inuse_window,
-                has_multiplexed_session: false,
+                has_multiplexed_session: sessions.multiplexed_session.is_some(),
             }
         })
     }
@@ -473,6 +486,12 @@ pub struct SessionConfig {
     /// incStep is the number of sessions to create in one batch when at least
     /// one more session is needed.
     inc_step: usize,
+
+    /// enable_multiplexed_session enables multiplexed sessions.
+    pub enable_multiplexed_session: bool,
+
+    /// enable_multiplexed_session_for_rw enables multiplexed sessions for read-write transactions.
+    pub enable_multiplexed_session_for_rw: bool,
 }
 
 impl Default for SessionConfig {
@@ -486,6 +505,8 @@ impl Default for SessionConfig {
             session_alive_trust_duration: Duration::from_secs(55 * 60),
             session_get_timeout: Duration::from_secs(1),
             refresh_interval: Duration::from_secs(5 * 60),
+            enable_multiplexed_session: true,
+            enable_multiplexed_session_for_rw: true,
         }
     }
 }
@@ -510,7 +531,8 @@ impl TryAs<Status> for SessionError {
 }
 
 pub(crate) struct SessionManager {
-    session_pool: SessionPool,
+    pub(crate) session_pool: SessionPool,
+    multiplexed_session_sender: Option<UnboundedSender<oneshot::Sender<Result<SessionHandle, Status>>>>,
     cancel: CancellationToken,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -536,20 +558,37 @@ impl SessionManager {
         .await?;
 
         let cancel = CancellationToken::new();
-        let task_session_cleaner = Self::spawn_health_check_task(config, session_pool.clone(), cancel.clone());
-        let task_session_creator = Self::spawn_session_creation_task(
+        let mut tasks = vec![];
+        tasks.push(Self::spawn_health_check_task(config.clone(), session_pool.clone(), cancel.clone()));
+        tasks.push(Self::spawn_session_creation_task(
             session_pool.clone(),
-            database,
-            conn_pool,
+            database.clone(),
+            conn_pool.clone(),
             receiver,
             cancel.clone(),
             disable_route_to_leader,
-        );
+        ));
+
+        let multiplexed_session_sender = if config.enable_multiplexed_session {
+            let (ms_sender, ms_receiver) = mpsc::unbounded_channel();
+            tasks.push(Self::spawn_multiplexed_session_task(
+                session_pool.clone(),
+                database,
+                conn_pool,
+                ms_receiver,
+                cancel.clone(),
+                disable_route_to_leader,
+            ));
+            Some(ms_sender)
+        } else {
+            None
+        };
 
         let sm = SessionManager {
             session_pool,
+            multiplexed_session_sender,
             cancel,
-            tasks: Mutex::new(vec![task_session_cleaner, task_session_creator]),
+            tasks: Mutex::new(tasks),
         };
         Ok(Arc::new(sm))
     }
@@ -560,6 +599,24 @@ impl SessionManager {
 
     pub async fn get(&self) -> Result<ManagedSession, SessionError> {
         self.session_pool.acquire().await
+    }
+
+    pub async fn get_multiplexed(&self) -> Result<ManagedSession, SessionError> {
+        if let Some(ref sender) = self.multiplexed_session_sender {
+            // check if we already have one
+            if let Some(session) = { self.session_pool.inner.read().multiplexed_session.clone() } {
+                // TODO: check expiration (7 days)
+                return Ok(ManagedSession::new(self.session_pool.clone(), session));
+            }
+
+            // request one
+            let (tx, rx) = oneshot::channel();
+            sender.send(tx).map_err(|_| SessionError::FailedToCreateSession)?;
+            let session = rx.await.map_err(|_| SessionError::FailedToCreateSession)??;
+            Ok(ManagedSession::new(self.session_pool.clone(), session))
+        } else {
+            self.get().await
+        }
     }
 
     pub async fn close(&self) {
@@ -637,6 +694,68 @@ impl SessionManager {
                 .await;
             }
             tracing::trace!("shutdown health check task.")
+        })
+    }
+
+    fn spawn_multiplexed_session_task(
+        session_pool: SessionPool,
+        database: String,
+        conn_pool: ConnectionManager,
+        mut rx: UnboundedReceiver<oneshot::Sender<Result<SessionHandle, Status>>>,
+        cancel: CancellationToken,
+        disable_route_to_leader: bool,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60 * 60)); // Check every hour
+            loop {
+                let waiter = select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = interval.tick() => None,
+                    waiter = rx.recv() => waiter,
+                };
+
+                let current_session = { session_pool.inner.read().multiplexed_session.clone() };
+                let mut should_create = current_session.is_none();
+
+                if let Some(ref session) = current_session {
+                    if session.last_used_at.elapsed() > Duration::from_secs(6 * 24 * 60 * 60) {
+                        // Refresh after 6 days to be safe (design doc says valid for at least 7 days)
+                        should_create = true;
+                    }
+                }
+
+                if should_create {
+                    let mut client = conn_pool
+                        .conn()
+                        .with_metrics(session_pool.metrics.clone())
+                        .with_metadata(client_metadata(&database));
+                    let request = CreateSessionRequest {
+                        database: database.clone(),
+                        session: Some(Session {
+                            multiplexed: true,
+                            ..Default::default()
+                        }),
+                    };
+                    match client.create_session(request, disable_route_to_leader, None).await {
+                        Ok(resp) => {
+                            let session = SessionHandle::new(resp.into_inner(), client, Instant::now());
+                            session_pool.inner.write().multiplexed_session = Some(session.clone());
+                            if let Some(w) = waiter {
+                                let _ = w.send(Ok(session));
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(w) = waiter {
+                                let _ = w.send(Err(e));
+                            }
+                        }
+                    }
+                } else if let Some(w) = waiter {
+                    let _ = w.send(Ok(current_session.unwrap()));
+                }
+            }
+            tracing::trace!("shutdown multiplexed session task.")
         })
     }
 }

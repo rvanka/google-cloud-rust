@@ -1,6 +1,8 @@
 use std::ops::DerefMut;
+use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 
+use parking_lot::Mutex;
 use prost_types::Struct;
 
 use google_cloud_gax::grpc::Status;
@@ -8,7 +10,7 @@ use google_cloud_gax::retry::RetrySetting;
 use google_cloud_googleapis::spanner::v1::request_options::Priority;
 use google_cloud_googleapis::spanner::v1::{
     execute_sql_request::QueryMode, execute_sql_request::QueryOptions as ExecuteQueryOptions, ExecuteSqlRequest,
-    ReadRequest, RequestOptions, TransactionSelector,
+    MultiplexedSessionPrecommitToken, ReadRequest, RequestOptions, TransactionSelector,
 };
 
 use crate::key::{Key, KeySet};
@@ -108,6 +110,10 @@ pub struct Transaction {
     /// disableRouteToLeader specifies if all the requests of type read-write and PDML
     /// need to be routed to the leader region.
     pub(crate) disable_route_to_leader: bool,
+
+    pub(crate) latest_precommit_token: Arc<Mutex<Option<MultiplexedSessionPrecommitToken>>>,
+
+    pub(crate) _previous_transaction_id: Option<Vec<u8>>,
 }
 
 impl Transaction {
@@ -161,12 +167,16 @@ impl Transaction {
             directed_read_options: None,
             last_statement: false,
         };
+        let handler = self.create_precommit_token_handler();
         let session = self.session.as_mut().unwrap().deref_mut();
         let reader = StatementReader {
             enable_resume: options.enable_resume,
             request,
         };
-        RowIterator::new(session, reader, Some(options.call_options), self.disable_route_to_leader).await
+        let mut row_iterator =
+            RowIterator::new(session, reader, Some(options.call_options), self.disable_route_to_leader).await?;
+        row_iterator.precommit_token_handler = Some(handler);
+        Ok(row_iterator)
     }
 
     /// read returns a RowIterator for reading multiple rows from the database.
@@ -227,10 +237,14 @@ impl Transaction {
             lock_hint: 0,
         };
 
+        let handler = self.create_precommit_token_handler();
         let disable_route_to_leader = self.disable_route_to_leader;
         let session = self.as_mut_session();
         let reader = TableReader { request };
-        RowIterator::new(session, reader, Some(options.call_options), disable_route_to_leader).await
+        let mut row_iterator =
+            RowIterator::new(session, reader, Some(options.call_options), disable_route_to_leader).await?;
+        row_iterator.precommit_token_handler = Some(handler);
+        Ok(row_iterator)
     }
 
     /// read returns a RowIterator for reading multiple rows from the database.
@@ -264,6 +278,37 @@ impl Transaction {
             .await?;
         reader.set_call_options(call_options);
         reader.next().await
+    }
+
+    pub(crate) fn update_precommit_token(&self, token: Option<MultiplexedSessionPrecommitToken>) {
+        if let Some(token) = token {
+            let mut latest = self.latest_precommit_token.lock();
+            if let Some(ref current) = *latest {
+                if token.seq_num > current.seq_num {
+                    *latest = Some(token);
+                }
+            } else {
+                *latest = Some(token);
+            }
+        }
+    }
+
+    pub(crate) fn create_precommit_token_handler(
+        &self,
+    ) -> Arc<dyn Fn(Option<MultiplexedSessionPrecommitToken>) + Send + Sync> {
+        let latest = self.latest_precommit_token.clone();
+        Arc::new(move |token| {
+            if let Some(token) = token {
+                let mut latest = latest.lock();
+                if let Some(ref current) = *latest {
+                    if token.seq_num > current.seq_num {
+                        *latest = Some(token);
+                    }
+                } else {
+                    *latest = Some(token);
+                }
+            }
+        })
     }
 
     pub(crate) fn get_session_name(&self) -> String {

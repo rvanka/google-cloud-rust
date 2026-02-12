@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use google_cloud_gax::conn::{ConnectionManager as GRPCConnectionManager, ConnectionOptions, Environment, Error};
 use google_cloud_googleapis::spanner::v1::spanner_client::SpannerClient;
 
@@ -10,8 +11,9 @@ pub const SCOPES: [&str; 2] = [
     "https://www.googleapis.com/auth/spanner.data",
 ];
 
+#[derive(Clone)]
 pub struct ConnectionManager {
-    inner: GRPCConnectionManager,
+    inner: Arc<GRPCConnectionManager>,
 }
 
 impl ConnectionManager {
@@ -22,7 +24,7 @@ impl ConnectionManager {
         conn_options: &ConnectionOptions,
     ) -> Result<Self, Error> {
         Ok(ConnectionManager {
-            inner: GRPCConnectionManager::new(pool_size, domain, AUDIENCE, environment, conn_options).await?,
+            inner: Arc::new(GRPCConnectionManager::new(pool_size, domain, AUDIENCE, environment, conn_options).await?),
         })
     }
 

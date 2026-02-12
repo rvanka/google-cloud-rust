@@ -1,7 +1,9 @@
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::time::SystemTime;
 
+use parking_lot::Mutex;
 use time::OffsetDateTime;
 
 use crate::key::KeySet;
@@ -66,6 +68,8 @@ impl ReadOnlyTransaction {
                 },
                 transaction_tag: None,
                 disable_route_to_leader: true,
+                latest_precommit_token: Arc::new(Mutex::new(None)),
+                _previous_transaction_id: None,
             },
             rts: None,
         })
@@ -106,6 +110,8 @@ impl ReadOnlyTransaction {
                         },
                         transaction_tag: None,
                         disable_route_to_leader: true,
+                        latest_precommit_token: Arc::new(Mutex::new(None)),
+                        _previous_transaction_id: None,
                     },
                     rts: Some(OffsetDateTime::from(st)),
                 })

@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use google_cloud_gax::conn::{ConnectionOptions, Environment};
 use google_cloud_gax::grpc::{Code, Status};
 use google_cloud_gax::retry::{invoke_fn, TryAs};
@@ -102,6 +103,10 @@ impl Default for ClientConfig {
         };
         config.session_config.min_opened = config.channel_config.num_channels * 4;
         config.session_config.max_opened = config.channel_config.num_channels * 100;
+        config.session_config.enable_multiplexed_session =
+            var("GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS").ok().map(|v| v != "false").unwrap_or(true);
+        config.session_config.enable_multiplexed_session_for_rw =
+            var("GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS_FOR_RW").ok().map(|v| v != "false").unwrap_or(true);
         config
     }
 }
@@ -246,7 +251,7 @@ impl Client {
     /// where only a single read or query is needed.  This is more efficient than
     /// using read_only_transaction for a single read or query.
     pub async fn single_with_timestamp_bound(&self, tb: TimestampBound) -> Result<ReadOnlyTransaction, Error> {
-        let session = self.get_session().await?;
+        let session = self.sessions.get_multiplexed().await?;
         let result = ReadOnlyTransaction::single(session, tb).await?;
         Ok(result)
     }
@@ -296,7 +301,7 @@ impl Client {
         &self,
         options: ReadOnlyTransactionOption,
     ) -> Result<ReadOnlyTransaction, Error> {
-        let session = self.get_session().await?;
+        let session = self.sessions.get_multiplexed().await?;
         let result = ReadOnlyTransaction::begin(session, options.timestamp_bound, options.call_options).await?;
         Ok(result)
     }
@@ -318,7 +323,7 @@ impl Client {
         &self,
         options: ReadOnlyTransactionOption,
     ) -> Result<BatchReadOnlyTransaction, Error> {
-        let session = self.get_session().await?;
+        let session = self.sessions.get_multiplexed().await?;
         let result = BatchReadOnlyTransaction::begin(session, options.timestamp_bound, options.call_options).await?;
         Ok(result)
     }
@@ -350,7 +355,7 @@ impl Client {
         options: PartitionedUpdateOption,
     ) -> Result<i64, Error> {
         let ro = TransactionRetrySetting::new(vec![Code::Aborted, Code::Internal]);
-        let session = Some(self.get_session().await?);
+        let session = Some(self.sessions.get_multiplexed().await?);
 
         // reuse session
         invoke_fn(
@@ -414,7 +419,7 @@ impl Client {
                     mode: Some(transaction_options::Mode::ReadWrite(transaction_options::ReadWrite::default())),
                     isolation_level: IsolationLevel::Unspecified as i32,
                 });
-                match commit(session, ms.clone(), tx, options.clone(), self.disable_route_to_leader).await {
+                match commit(session, ms.clone(), tx, options.clone(), self.disable_route_to_leader, None).await {
                     Ok(s) => Ok(Some(s.into())),
                     Err(e) => Err((Error::GRPC(e), session)),
                 }
@@ -550,16 +555,38 @@ impl Client {
         let (bo, co, tag) = Client::split_read_write_transaction_option(options);
 
         let ro = TransactionRetrySetting::default();
-        let session = Some(self.get_session().await?);
+        let session = Some(if self.sessions.session_pool.config.enable_multiplexed_session_for_rw {
+            self.sessions.get_multiplexed().await?
+        } else {
+            self.sessions.get().await?
+        });
+        let previous_transaction_id = Arc::new(Mutex::new(None));
         // must reuse session
         invoke_fn(
             Some(ro),
-            |session| async {
-                let mut tx = self
-                    .create_read_write_transaction::<E>(session, bo.clone(), tag.clone())
-                    .await?;
-                let result = f(&mut tx).await;
-                tx.finish(result, Some(co.clone())).await
+            |session| {
+                let f = &f;
+                let bo = bo.clone();
+                let tag = tag.clone();
+                let co = co.clone();
+                let previous_transaction_id = previous_transaction_id.clone();
+                async move {
+                    let mut tx = self
+                        .create_read_write_transaction::<E>(
+                            session,
+                            bo,
+                            tag,
+                            previous_transaction_id.lock().clone(),
+                        )
+                        .await?;
+                    let tx_id = tx.tx_id.clone();
+                    let result = f(&mut tx).await;
+                    let finish_result = tx.finish(result, Some(co)).await;
+                    if finish_result.is_err() {
+                        *previous_transaction_id.lock() = Some(tx_id);
+                    }
+                    finish_result
+                }
             },
             session,
         )
@@ -607,13 +634,18 @@ impl Client {
     ///     Ok(())
     /// }
     /// ```
-    pub async fn begin_read_write_transaction(&self) -> Result<ReadWriteTransaction, Error> {
-        let session = self.get_session().await?;
+    pub async fn begin_read_write_transaction(&self, previous_transaction_id: Option<Vec<u8>>) -> Result<ReadWriteTransaction, Error> {
+        let session = if self.sessions.session_pool.config.enable_multiplexed_session_for_rw {
+            self.sessions.get_multiplexed().await?
+        } else {
+            self.sessions.get().await?
+        };
         ReadWriteTransaction::begin(
             session,
             ReadWriteTransactionOption::default().begin_options,
             ReadWriteTransactionOption::default().transaction_tag,
             self.disable_route_to_leader,
+            previous_transaction_id,
         )
         .await
         .map_err(|e| e.status.into())
@@ -635,14 +667,18 @@ impl Client {
         let (bo, co, tag) = Client::split_read_write_transaction_option(options);
 
         let ro = TransactionRetrySetting::default();
-        let session = Some(self.get_session().await?);
+        let session = Some(if self.sessions.session_pool.config.enable_multiplexed_session_for_rw {
+            self.sessions.get_multiplexed().await?
+        } else {
+            self.sessions.get().await?
+        });
 
         // reuse session
         invoke_fn(
             Some(ro),
             |session| async {
                 let mut tx = self
-                    .create_read_write_transaction::<E>(session, bo.clone(), tag.clone())
+                    .create_read_write_transaction::<E>(session, bo.clone(), tag.clone(), None)
                     .await?;
                 let result = f(&mut tx);
                 tx.finish(result, Some(co.clone())).await
@@ -657,11 +693,12 @@ impl Client {
         session: Option<ManagedSession>,
         bo: CallOptions,
         transaction_tag: Option<String>,
+        previous_transaction_id: Option<Vec<u8>>,
     ) -> Result<ReadWriteTransaction, (E, Option<ManagedSession>)>
     where
         E: TryAs<Status> + From<SessionError> + From<Status>,
     {
-        ReadWriteTransaction::begin(session.unwrap(), bo, transaction_tag, self.disable_route_to_leader)
+        ReadWriteTransaction::begin(session.unwrap(), bo, transaction_tag, self.disable_route_to_leader, previous_transaction_id)
             .await
             .map_err(|e| (E::from(e.status), Some(e.session)))
     }
