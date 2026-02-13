@@ -1,10 +1,31 @@
-use google_cloud_spanner::client::{Client, ClientConfig, Error};
-use google_cloud_spanner::mutation::insert_or_update;
-use google_cloud_spanner::statement::Statement;
+use gcloud_spanner::client::{Client, ClientConfig, Error};
+use gcloud_spanner::mutation::insert_or_update;
+use gcloud_spanner::statement::{Statement, ToKind};
 use std::env;
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// GCP Project ID
+    #[arg(short, long, default_value = "span-cloud-testing")]
+    project: String,
+
+    /// Spanner Instance ID
+    #[arg(short, long, default_value = "rajeshwarv-http-test-instance")]
+    instance: String,
+
+    /// Spanner Database ID
+    #[arg(short, long, default_value = "rust-client-test")]
+    database: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
+    rustls::crypto::aws_lc_rs::default_provider().install_default().expect("Failed to install rustls crypto provider");
+
     // Enable tracing to see what's happening
     tracing_subscriber::fmt::init();
 
@@ -12,26 +33,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env::set_var("GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS", "true");
     env::set_var("GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS_FOR_RW", "true");
 
-    let project_id = env::var("SPANNER_PROJECT_ID").expect("SPANNER_PROJECT_ID must be set");
-    let instance_id = env::var("SPANNER_INSTANCE_ID").expect("SPANNER_INSTANCE_ID must be set");
-    let database_id = env::var("SPANNER_DATABASE_ID").expect("SPANNER_DATABASE_ID must be set");
-    let database = format!("projects/{}/instances/{}/databases/{}", project_id, instance_id, database_id);
+    let database_path = format!(
+        "projects/{}/instances/{}/databases/{}",
+        args.project, args.instance, args.database
+    );
 
-    println!("Connecting to {}...", database);
+    println!("Connecting to {}...", database_path);
 
-    // This example assumes Application Default Credentials are set up
+    // Using ClientConfig::default().with_auth().await? will use Application Default Credentials (ADC)
+    // which works with `gcloud auth login` or `gcloud auth application-default login`.
     let config = ClientConfig::default().with_auth().await?;
-    let client = Client::new(database, config).await?;
+    let client = Client::new(database_path, config).await?;
 
     println!("Initial session count: {}", client.session_count());
 
-    // Perform a Read-Write Transaction using multiplexed session
+    // Perform a Read-Write Transaction
     println!("Starting RW transaction using multiplexed session...");
     
     let result = client.read_write_transaction::<String, Error, _>(|tx| {
         Box::pin(async move {
             // 1. Read existing value
-            // Assumes a table 'my_table' with 'id_column' (INT64) and 'name_column' (STRING)
             let mut stmt = Statement::new("SELECT name_column FROM my_table WHERE id_column = @id");
             stmt.add_param("id", &1i64);
             
@@ -49,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let new_val = new_val_int.to_string();
             println!("Updating to new value: {}", new_val);
             
-            let m = insert_or_update("my_table", &["id_column", "name_column"], &[&1i64, &new_val]);
+            let m = insert_or_update("my_table", &["id_column", "name_column"], &[&1i64 as &dyn ToKind, &new_val as &dyn ToKind]);
             tx.buffer_write(vec![m]);
             
             Ok(new_val)
@@ -74,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(val, updated_val);
     }
 
-    println!("Example completed successfully!");
+    println!("Test completed successfully!");
 
     client.close().await;
     Ok(())
